@@ -1,0 +1,11 @@
+[package]
+name = "mp"
+version = "0.1.0"
+authors = ["stardust"]
+edition = "2018"
+
+[features]
+
+log = []
+
+[dependencies]
