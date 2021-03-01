@@ -3,7 +3,13 @@ use std::{
     net::TcpListener,
 };
 
+use std::sync::{Arc, Mutex, RwLock};
+
 use std::collections::HashMap;
+
+pub mod pool;
+pub mod request;
+pub mod response;
 
 pub struct RequestContext {
     pub headers: HashMap<String, String>,
@@ -11,7 +17,7 @@ pub struct RequestContext {
 
 pub struct Server {
     pub port: u16,
-    get_handlers: HashMap<String, Box<dyn Fn()>>,
+    get_handlers: HashMap<String, Box<dyn Fn(request::Request, response::Response)>>,
 }
 
 #[derive(Debug)]
@@ -42,6 +48,27 @@ impl HTTPMethods {
     }
 }
 
+pub struct Router {
+    pub get_handlers:
+        HashMap<String, Box<dyn Fn(request::Request, response::Response) + Sync + Send + 'static>>,
+}
+
+impl Router {
+    pub fn new() -> Router {
+        Router {
+            get_handlers: HashMap::new(),
+        }
+    }
+
+    pub fn get<T>(&mut self, path: &str, handler: T)
+    where
+        T: Fn(request::Request, response::Response) + Send + Sync + 'static,
+    {
+        self.get_handlers
+            .insert(path.to_string(), Box::new(handler));
+    }
+}
+
 impl Server {
     /// Create a new server instance.
     /// # Example
@@ -58,72 +85,25 @@ impl Server {
     }
 
     /// Start listening to connections on given port.
-    pub fn serve(&mut self) {
-        self.run();
+    pub fn serve(&mut self, router: Router) {
+        self.run(router);
     }
 
-    fn run(&mut self) {
+    fn run(&mut self, router: Router) {
+        let tpool = pool::Pool::new(32);
+
         let server = match TcpListener::bind(format!("localhost:{}", self.port)) {
             Ok(s) => s,
             Err(e) => panic!("Failed to bind: {}", e),
         };
 
+        let router_mut = Arc::new(RwLock::new(router));
+
         for socket in server.incoming() {
-            if let Ok(mut s) = socket {
-                let mut buf = [0; 1024];
-                match s.read(&mut buf) {
-                    Ok(s) => {
-                        if cfg!(feature = "log") {
-                            println!("[Req] : Read {} bytes", s)
-                        }
-                    }
-                    Err(e) => {
-                        if cfg!(feature = "log") {
-                            println!("Failed to read: {}", e)
-                        }
-                    }
-                };
-                let req_body = String::from_utf8_lossy(&buf);
-
-                let mut headers = HashMap::new();
-
-                for (idx, line) in req_body.lines().enumerate() {
-                    if idx == 0 {
-                        let req_line: Vec<&str> = line.split(" ").collect();
-                        headers.insert("method".to_string(), req_line[0].to_string());
-                        headers.insert("path".to_string(), req_line[1].to_string());
-                    } else {
-                        let parts: Vec<&str> = line.split(": ").collect();
-                        if parts.len() > 1 {
-                            headers.insert(parts[0].to_string(), parts[1].to_string());
-                        }
-                    }
-                }
-
-                println!("{:?}", headers);
-
-                let method = headers.get("method").unwrap();
-
-                match HTTPMethods::to_http(&method) {
-                    HTTPMethods::GET => {
-                        let handler = self.get_handlers.get(headers.get("path").unwrap());
-                        handler.unwrap()();
-                    }
-                    HTTPMethods::POST => {}
-                    HTTPMethods::DELETE => {}
-                    HTTPMethods::PATCH => {}
-                    HTTPMethods::PUT => {}
-                };
-
-                let ctx = RequestContext { headers };
-
-                let mut resp = String::new();
-                resp.push_str("HTTP/1.1 200 OK\r\n\r\n<h1>sike</h1>");
-
-                let written = s.write(resp.as_bytes()).unwrap();
-
-                println!("Written {} bytes", written)
-            }
+            let socket = socket.unwrap();
+            let router = Arc::clone(&router_mut);
+            //handle_conn(socket, router);
+            tpool.execute(move || handle_conn(socket, router));
         }
     }
 
@@ -143,7 +123,7 @@ impl Server {
     /// ```
     pub fn get<T>(&mut self, path: &str, handler: T)
     where
-        T: Fn() + Send + 'static,
+        T: Fn(request::Request, response::Response) + Send + Sync + 'static,
     {
         self.get_handlers
             .insert(path.to_string(), Box::new(handler));
@@ -156,4 +136,59 @@ impl Server {
     pub fn put() {}
 
     pub fn patch() {}
+}
+
+fn handle_conn(mut s: std::net::TcpStream, router: Arc<RwLock<Router>>) {
+    let mut buf = [0; 1024];
+    match s.read(&mut buf) {
+        Ok(s) => {
+            //println!("[Req] : Read {} bytes", s);
+            if s == 0 {
+                return;
+            }
+        }
+        Err(e) => {
+            println!("Failed to read: {}", e)
+        }
+    };
+    let req_body = String::from_utf8_lossy(&buf);
+    let mut headers = HashMap::new();
+
+    for (idx, line) in req_body.lines().enumerate() {
+        if idx == 0 {
+            let req_line: Vec<&str> = line.split(" ").collect();
+            headers.insert("method".to_string(), req_line[0].to_string());
+            headers.insert("path".to_string(), req_line[1].to_string());
+        } else {
+            let parts: Vec<&str> = line.split(": ").collect();
+            if parts.len() > 1 {
+                headers.insert(parts[0].to_string(), parts[1].to_string());
+            }
+        }
+    }
+
+    let req = request::Request::new(headers);
+    let method = req.headers.get("method").unwrap();
+    let resp = response::Response::new(s);
+
+    match HTTPMethods::to_http(&method) {
+        HTTPMethods::GET => {
+            if req.headers.get("path").unwrap() == "/favicon.ico" {
+                return;
+            }
+            let locked_router = router.read().unwrap();
+            let hand = locked_router
+                .get_handlers
+                .get(req.headers.get("path").unwrap())
+                .unwrap();
+
+            hand(req, resp);
+        }
+        HTTPMethods::POST => {
+            println!("{:?}", req.headers);
+        }
+        HTTPMethods::DELETE => {}
+        HTTPMethods::PATCH => {}
+        HTTPMethods::PUT => {}
+    };
 }
